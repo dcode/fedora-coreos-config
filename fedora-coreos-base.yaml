@@ -120,6 +120,228 @@ postprocess:
     [Install]
     WantedBy=multi-user.target
     EOF
+    
+    # Create stand-in etcd-wrapper until upstream ignition makes this generic
+    cat > /usr/lib/systemd/system/etcd-member.service << 'EOF'
+    [Unit]
+    Description=etcd (System Application Container)
+    Documentation=https://github.com/coreos/etcd
+    Wants=network-online.target network.target
+    After=network-online.target
+    Conflicts=etcd.service
+    Conflicts=etcd2.service
+    [Service]
+    Restart=on-failure
+    RestartSec=10s
+    TimeoutStartSec=0
+    LimitNOFILE=40000
+    Environment="ETCD_IMAGE_TAG=v3.3.10"
+    Environment="ETCD_NAME=%m"
+    Environment="ETCD_USER=etcd"
+    Environment="ETCD_DATA_DIR=/var/lib/etcd"
+    Environment="CONTAINER_NAME=%N"
+    ExecStartPre=-/usr/bin/podman rm "${CONTAINER_NAME}"
+    ExecStart=/usr/lib/coreos/etcd-wrapper $ETCD_OPTS
+    ExecStop=-/usr/bin/podman stop "${CONTAINER_NAME}"
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    mkdir -p /usr/lib/coreos
+    cat > /usr/lib/coreos/etcd-wrapper << 'EOF'
+    #!/usr/bin/bash -e
+    # Wrapper for launching etcd via rkt.
+    #
+    # Make sure to set ETCD_IMAGE_TAG to an image tag published here:
+    # https://quay.io/repository/coreos/etcd?tab=tags Alternatively,
+    # override ETCD_IMAGE to a custom image.
+
+    function require_ev_all() {
+        for rev in $@ ; do
+            if [[ -z "${!rev}" ]]; then
+                echo ${rev} is not set
+                exit 1
+            fi
+        done
+    }
+
+    function require_ev_one() {
+        for rev in $@ ; do
+            if [[ ! -z "${!rev}" ]]; then
+                return
+            fi
+        done
+        echo One of $@ must be set
+        exit 1
+    }
+
+    require_ev_one ETCD_IMAGE ETCD_IMAGE_TAG
+    require_ev_all ETCD_USER ETCD_DATA_DIR
+
+    ETCD_IMAGE_URL="${ETCD_IMAGE_URL:-quay.io/coreos/etcd}"
+    ETCD_IMAGE="${ETCD_IMAGE:-${ETCD_IMAGE_URL}:${ETCD_IMAGE_TAG}}"
+    CONTAINER_NAME="${CONTAINER_NAME:-etcd-member}"
+
+    if [[ ! -e "${ETCD_DATA_DIR}" ]]; then
+        mkdir --parents "${ETCD_DATA_DIR}"
+        chown "${ETCD_USER}" "${ETCD_DATA_DIR}"
+    fi
+
+    # Do not pass ETCD_DATA_DIR through to the container. The default path,
+    # /var/lib/etcd is always used inside the container.
+    etcd_data_dir="${ETCD_DATA_DIR}"
+    ETCD_DATA_DIR="/var/lib/etcd"
+
+    ETCD_IMAGE_ARGS="${ETCD_IMAGE_ARGS} -data-dir=${ETCD_DATA_DIR}"
+    ETCD_SSL_DIR="${ETCD_SSL_DIR:-/etc/ssl/certs}"
+
+    SYSTEMD_SYSTEM_DIR_SRC="${SYSTEMD_SYSTEM_DIR_SRC:-/run/systemd/system}"
+    if [[ -d "${SYSTEMD_SYSTEM_DIR_SRC}" ]]; then
+        PODMAN_RUN_ARGS="${PODMAN_RUN_ARGS} \
+            --mount type=bind,ro=true,source=${SYSTEMD_SYSTEM_DIR_SRC},destination=/run/systemd/system \
+        "
+    fi
+
+    PODMAN="${PODMAN:-/usr/bin/podman}"
+    set -x
+    exec ${PODMAN} ${PODMAN_GLOBAL_ARGS} \
+        run ${PODMAN_RUN_ARGS} \
+        --name ${CONTAINER_NAME} \
+        --env 'ETCD_NAME=${ETCD_NAME}' \
+        --env ETCD_DATA_DIR=${ETCD_DATA_DIR} \
+        --network host \
+        --user=$(id -u "${ETCD_USER}") \
+        --mount type=bind,ro=true,source="${ETCD_SSL_DIR}",destination=/etc/ssl/certs/:ro \
+        --mount type=bind,ro=true,source=/usr/share/pki,destination=/usr/share/ca-certificates \
+        --mount type=bind,bind-propagation=z,source="${etcd_data_dir}",destination=/var/lib/etcd \
+        ${ETCD_IMAGE} \
+        /usr/local/bin/etcd \
+        ${ETCD_IMAGE_ARGS} \
+        "$@"
+    EOF
+    chmod a+x /usr/lib/coreos/etcd-wrapper
+    
+    # Add coreos toolbox using fedora image
+    cat > /usr/bin/toolbox << 'EOF'
+    #!/bin/bash
+    set -eo pipefail
+
+    trap cleanup EXIT
+
+    setup() {
+        REGISTRY=registry.fedoraproject.org
+        IMAGE=fedora:latest
+        TOOLBOX_NAME=toolbox-"${USER}"
+
+        # Allow user overrides
+
+        toolboxrc="${HOME}"/.toolboxrc
+        if [ -f "${toolboxrc}" ]; then
+            echo ".toolboxrc file detected, overriding defaults..."
+            source "${toolboxrc}"
+        fi
+        TOOLBOX_IMAGE="${REGISTRY}"/"${IMAGE}"
+    }
+
+    run() {
+        if ! image_exists; then
+            image_pull
+        fi
+
+        if ! container_exists; then
+            echo "Spawning a container '$TOOLBOX_NAME' with image '$TOOLBOX_IMAGE'"
+            container_create
+        else
+            echo "Container '$TOOLBOX_NAME' already exists. Starting..."
+            echo "(To remove the container and start with a fresh toolbox, run: sudo podman rm '$TOOLBOX_NAME')"
+        fi
+
+        local state=$(container_state)
+        if [[ "$state" == configured ]] || [[ "$state" == exited ]]; then
+            container_start
+        elif [[ "$state" != running ]]; then
+            echo "Container '$TOOLBOX_NAME' in unknown state: '$state'"
+            return 1
+        fi
+
+        echo "Container started successfully."
+        container_exec "$@"
+    }
+
+    cleanup() {
+        sudo podman stop "$TOOLBOX_NAME" &>/dev/null
+    }
+
+    container_exists() {
+        sudo podman inspect "$TOOLBOX_NAME" &>/dev/null
+    }
+
+    container_state() {
+        sudo podman inspect "$TOOLBOX_NAME" --format '{{.State.Status}}'
+    }
+
+    image_exists() {
+        sudo podman inspect "$TOOLBOX_IMAGE" &>/dev/null
+    }
+
+    image_pull() {
+        if ! sudo podman pull "$TOOLBOX_IMAGE"; then
+            read -r -p "Would you like to authenticate to registry: '${REGISTRY}' and try again? [y/N] "
+
+            if [[ $REPLY =~ ^([Yy][Ee][Ss]|[Yy])+$ ]]; then
+                sudo podman login "${REGISTRY}"
+                sudo podman pull "$TOOLBOX_IMAGE"
+            else
+                echo "Exiting..."
+                exit 1
+            fi
+        fi
+    }
+
+    container_create() {
+        if ! sudo podman create \
+                     --hostname toolbox \
+                     --name "$TOOLBOX_NAME" \
+                     --network host \
+                     --privileged \
+                     --security-opt label=disable \
+                     --tty \
+                     --volume /:/media/root:rslave \
+                     "$TOOLBOX_IMAGE" 2>&1; then
+            echo "$0: failed to create container '$TOOLBOX_NAME'"
+            exit 1
+        fi
+    }
+
+    container_start() {
+        if ! sudo podman start "$TOOLBOX_NAME" 2>&1; then
+            echo "$0: failed to start container '$TOOLBOX_NAME'"
+            exit 1
+        fi
+    }
+
+    container_exec() {
+        sudo podman exec \
+                --env LANG="$LANG" \
+                --env TERM="$TERM" \
+                --tty \
+                "$TOOLBOX_NAME" \
+                "$@"
+    }
+
+    main() {
+        setup
+        run "$@"
+        cleanup
+    }
+
+    if [ ! -n "$*" ]; then
+        set /bin/sh "$@"
+    fi
+
+    main "$@"
+    EOF
+    chmod a+x /usr/bin/toolbox
 
     cat >/usr/lib/systemd/system-preset/42-coreos.preset << EOF
     # Presets here that eventually should live in the generic fedora presets
